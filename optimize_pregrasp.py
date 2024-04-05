@@ -13,6 +13,7 @@ from pybullet_robot.robots import robot_configs
 from math_utils import minimum_wrench_reward, euler_angles_to_matrix
 from pb_grasp_visualizer import GraspVisualizer
 from create_arrow import create_direct_arrow
+import viz_utils as v_utils
 
 
 EE_OFFSETS = [[0.0, -0.04, 0.015],
@@ -1042,7 +1043,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_iters", type=int, default=200)
     parser.add_argument("--exp_name", type=str, required=True)
     parser.add_argument("--mode", type=str, default="prob")
-    parser.add_argument("--hand", type=str, default="allegro")
+    parser.add_argument("--hand", type=str, default="allegro", choices=["allegro", "leap", "allegro_right"])
     parser.add_argument("--use_config", action="store_true", default=False)
     parser.add_argument("--mass", type=float, default=0.5)
     parser.add_argument("--com_x", type=float, default=0.0)
@@ -1055,6 +1056,7 @@ if __name__ == "__main__":
     parser.add_argument("--uncertainty", type=float, default=50.0)
     parser.add_argument("--vis_gpis", action="store_true", default=False)
     parser.add_argument("--fast_exp", action="store_true", default=False)
+    parser.add_argument("--pcd_path", type=str, help="Path to point cloud .ply file")
     args = parser.parse_args()
 
     if args.use_config:
@@ -1070,7 +1072,7 @@ if __name__ == "__main__":
         args.floor_offset = config["floor_offset"]
         args.wrist_z -= args.floor_offset
 
-    if args.exp_name not in ["realsense", "pvd"]:
+    if args.exp_name not in ["realsense", "pvd", "file"]:
         mesh = o3d.io.read_triangle_mesh(f"assets/{args.exp_name}/{args.exp_name}.obj") # TODO: Unify other model
         pcd = mesh.sample_points_poisson_disk(4096)
         center = pcd.get_oriented_bounding_box().get_center()
@@ -1078,8 +1080,16 @@ if __name__ == "__main__":
         WRIST_OFFSET[:,1] += center[1]
         WRIST_OFFSET[:,2] += 2 * center[2]
     elif args.exp_name == "realsense":
-        pcd = o3d.io.read_point_cloud("../ComplianceDexSensor/obj_cropped.ply")
+        pcd_path = "/juno/u/clairech/ComplianceDex/assets/banana/nontextured.ply"
+        pcd = o3d.io.read_point_cloud(pcd_path)
         #center = pcd.get_oriented_bounding_box().get_center()
+        center = pcd.get_axis_aligned_bounding_box().get_center()
+        print("AABB:", pcd.get_axis_aligned_bounding_box(), center)
+        WRIST_OFFSET[:,0] += center[0]
+        WRIST_OFFSET[:,1] += center[1]
+        WRIST_OFFSET[:,2] += 2 * center[2]
+    elif args.exp_name == "file":
+        pcd = o3d.io.read_point_cloud(args.pcd_path)
         center = pcd.get_axis_aligned_bounding_box().get_center()
         print("AABB:", pcd.get_axis_aligned_bounding_box(), center)
         WRIST_OFFSET[:,0] += center[0]
@@ -1099,8 +1109,8 @@ if __name__ == "__main__":
     # GPIS formulation
     bound = max(max(pcd.get_axis_aligned_bounding_box().get_extent()) / 2 + 0.01, 0.1) # minimum bound is 0.1
     gpis = GPIS(0.08, 1)
-    if args.exp_name in ["realsense", "pvd"]:
-        if args.exp_name == "realsense":
+    if args.exp_name in ["realsense", "pvd", "file"]:
+        if args.exp_name == "realsense" or args.exp_name == "file":
             pcd_simple = pcd.farthest_point_down_sample(200)
             points = np.asarray(pcd_simple.points)
             points = torch.tensor(points).cuda().double()
@@ -1165,6 +1175,8 @@ if __name__ == "__main__":
     elif args.hand == "allegro":
         robot_urdf = "pybullet_robot/src/pybullet_robot/robots/allegro_hand/models/allegro_hand_description_left.urdf"
         #robot_urdf = "assets/kuka_allegro/model.urdf"
+    elif args.hand == "allegro_right":
+        robot_urdf = "pybullet_robot/src/pybullet_robot/robots/allegro_hand/models/allegro_hand_description_right.urdf"
 
     WRIST_OFFSET[:,0] += args.wrist_x
     WRIST_OFFSET[:,1] += args.wrist_y
@@ -1211,6 +1223,7 @@ if __name__ == "__main__":
                                                 gravity=False,
                                                 uncertainty=args.uncertainty)
     num_guesses = len(WRIST_OFFSET)
+    # Set initializations?
     init_joint_angles = init_joint_angles.repeat_interleave(num_guesses,dim=0)
     #target_pose = target_pose.repeat_interleave(num_guesses,dim=0)
     compliance = compliance.repeat_interleave(num_guesses,dim=0)
@@ -1252,21 +1265,42 @@ if __name__ == "__main__":
             continue
         if args.fast_exp:
             continue
-        tips, targets, arrows = vis_grasp(opt_tip_pose[i], opt_target_pose[i])
-        o3d.visualization.draw_geometries([pcd, *tips, *targets, *arrows])
+        #tips, targets, arrows = vis_grasp(opt_tip_pose[i], opt_target_pose[i])
+        #o3d.visualization.draw_geometries([pcd, *tips, *targets, *arrows])
         #check_force_closure(tip_pose, opt_target_pose[i], opt_compliance[i], opt_R[i], opt_t[i], center[:3], args.mass, 10.0 if not args.disable_gravity else 0.0)
+        print("Grasp:", i)
+        v_utils.vis_results(pcd, opt_tip_pose[i], opt_target_pose[i])
         if args.mode == "prob":
             after_tip = (opt_R[i]@opt_tip_pose[i].transpose(0,1)).transpose(0,1)+opt_t[i]
-            tips, targets, arrows = vis_grasp(after_tip, opt_target_pose[i])
+            #tips, targets, arrows = vis_grasp(after_tip, opt_target_pose[i])
             tf_pcd = copy.deepcopy(pcd)
             tf_pcd.rotate(opt_R[i].cpu().numpy(), center=[0,0,0])
             tf_pcd.translate(opt_t[i].cpu().numpy())
-            o3d.visualization.draw_geometries([tf_pcd, *tips, *targets, *arrows])
+            #o3d.visualization.draw_geometries([tf_pcd, *tips, *targets, *arrows])
+            print(opt_palm_pose[i])
+            v_utils.vis_results(
+                tf_pcd, after_tip, opt_target_pose[i],
+                wrist_pose=opt_palm_pose[i].cpu().detach().numpy(),
+                draw_frame=True,
+            )
     print("Feasible indices:",idx_list, "Feasible rate:", len(idx_list)/opt_tip_pose.shape[0])
-    if len(idx_list) > 0:
-        np.save(f"data/contact_{args.exp_name}.npy", opt_tip_pose.cpu().detach().numpy()[idx_list])
-        np.save(f"data/target_{args.exp_name}.npy", opt_target_pose.cpu().detach().numpy()[idx_list])
-        np.save(f"data/wrist_{args.exp_name}.npy", opt_palm_pose.cpu().detach().numpy()[idx_list])
-        np.save(f"data/compliance_{args.exp_name}.npy", opt_compliance.cpu().detach().numpy()[idx_list])
-        if args.mode == "prob":
-            np.save(f"data/joint_angle_{args.exp_name}.npy", opt_joint_angles.cpu().detach().numpy()[idx_list])
+    data_dict = {
+        "feasible_idx": np.array([idx_list]),
+        "opt_tip_pose": opt_tip_pose.cpu().detach().numpy(),
+        "opt_target_pose": opt_target_pose.cpu().detach().numpy(),
+        "opt_palm_pose": opt_palm_pose.cpu().detach().numpy(),
+        "opt_compliance": opt_compliance.cpu().detach().numpy(),
+        "input_pts": np.asarray(pcd.points),
+        "opt_t": opt_t.cpu().detach().numpy(),
+        "opt_R": opt_R.cpu().detach().numpy(),
+    }
+    np.save(f"data/contact_{args.exp_name}.npy", opt_tip_pose.cpu().detach().numpy()[idx_list])
+    np.save(f"data/target_{args.exp_name}.npy", opt_target_pose.cpu().detach().numpy()[idx_list])
+    np.save(f"data/wrist_{args.exp_name}.npy", opt_palm_pose.cpu().detach().numpy()[idx_list])
+    np.save(f"data/compliance_{args.exp_name}.npy", opt_compliance.cpu().detach().numpy()[idx_list])
+    if args.mode == "prob":
+        np.save(f"data/joint_angle_{args.exp_name}.npy", opt_joint_angles.cpu().detach().numpy()[idx_list])
+        data_dict["opt_joint_angles"] = opt_joint_angles.cpu().detach().numpy()
+    
+    #save_path = "data/claire_data/test.npz"
+    #np.savez_compressed(save_path, data=data_dict)
