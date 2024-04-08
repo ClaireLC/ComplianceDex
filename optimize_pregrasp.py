@@ -14,6 +14,7 @@ from math_utils import minimum_wrench_reward, euler_angles_to_matrix
 from pb_grasp_visualizer import GraspVisualizer
 from create_arrow import create_direct_arrow
 import viz_utils as v_utils
+import get_initial_conditions as init_cond
 
 
 EE_OFFSETS = [[0.0, -0.04, 0.015],
@@ -780,7 +781,7 @@ class ProbabilisticGraspOptimizer:
         self.num_iters = num_iters
         self.ee_link_names = ee_link_names
         self.ee_link_offsets = ee_link_offsets
-        print("Wrist offset:", palm_offset)
+        #print("Wrist offset:", palm_offset)
         self.palm_offset = torch.from_numpy(palm_offset).double().cuda()
         self.optimize_target = optimize_target
         self.optimize_palm = optimize_palm
@@ -1056,7 +1057,8 @@ if __name__ == "__main__":
     parser.add_argument("--uncertainty", type=float, default=50.0)
     parser.add_argument("--vis_gpis", action="store_true", default=False)
     parser.add_argument("--fast_exp", action="store_true", default=False)
-    parser.add_argument("--pcd_path", type=str, help="Path to point cloud .ply file")
+    parser.add_argument("--pcd_path", type=str, help="Path to input .npz file with points")
+    parser.add_argument("--viz_debug", action="store_true")
     args = parser.parse_args()
 
     if args.use_config:
@@ -1079,6 +1081,7 @@ if __name__ == "__main__":
         WRIST_OFFSET[:,0] += center[0]
         WRIST_OFFSET[:,1] += center[1]
         WRIST_OFFSET[:,2] += 2 * center[2]
+        init_wrist_poses = WRIST_OFFSET
     elif args.exp_name == "realsense":
         pcd_path = "/juno/u/clairech/ComplianceDex/assets/banana/nontextured.ply"
         pcd = o3d.io.read_point_cloud(pcd_path)
@@ -1088,13 +1091,14 @@ if __name__ == "__main__":
         WRIST_OFFSET[:,0] += center[0]
         WRIST_OFFSET[:,1] += center[1]
         WRIST_OFFSET[:,2] += 2 * center[2]
+        init_wrist_poses = WRIST_OFFSET
     elif args.exp_name == "file":
-        pcd = o3d.io.read_point_cloud(args.pcd_path)
+        # Create input pcd from .npz file
+        input_dict = np.load(args.pcd_path, allow_pickle=True)["data"].item() 
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(input_dict["pts_wf"])
         center = pcd.get_axis_aligned_bounding_box().get_center()
-        print("AABB:", pcd.get_axis_aligned_bounding_box(), center)
-        WRIST_OFFSET[:,0] += center[0]
-        WRIST_OFFSET[:,1] += center[1]
-        WRIST_OFFSET[:,2] += 2 * center[2]
+        init_wrist_poses = init_cond.get_init_wrist_pose_from_pcd(pcd, viz=args.viz_debug)
     elif args.exp_name == "pvd":
         data = np.load("../ComplianceDexSensor/completed_pcd.npz") # Should be in world frame
         obs_points = data["observed"]
@@ -1105,6 +1109,7 @@ if __name__ == "__main__":
         WRIST_OFFSET[:,0] += center[0]
         WRIST_OFFSET[:,1] += center[1]
         WRIST_OFFSET[:,2] += 2 * center[2]
+        init_wrist_poses = WRIST_OFFSET
     
     # GPIS formulation
     bound = max(max(pcd.get_axis_aligned_bounding_box().get_extent()) / 2 + 0.01, 0.1) # minimum bound is 0.1
@@ -1178,10 +1183,10 @@ if __name__ == "__main__":
     elif args.hand == "allegro_right":
         robot_urdf = "pybullet_robot/src/pybullet_robot/robots/allegro_hand/models/allegro_hand_description_right.urdf"
 
-    WRIST_OFFSET[:,0] += args.wrist_x
-    WRIST_OFFSET[:,1] += args.wrist_y
-    WRIST_OFFSET[:,2] += args.wrist_z
-
+    # Add user-specified wrist position offsets to initial wrist poses
+    init_wrist_poses[:,0] += args.wrist_x
+    init_wrist_poses[:,1] += args.wrist_y
+    init_wrist_poses[:,2] += args.wrist_z
 
     if args.mode in ["kingpis", "wc"]:
         grasp_optimizer = optimizers[args.mode](robot_urdf,
@@ -1195,7 +1200,7 @@ if __name__ == "__main__":
                                                 optimize_target=True,
                                                 optimize_palm=True, # NOTE: Experimental
                                                 num_iters=args.num_iters,
-                                                palm_offset=WRIST_OFFSET,
+                                                palm_offset=init_wrist_poses,
                                                 uncertainty=args.uncertainty,
                                                 # Useless for now
                                                 mass=args.mass, com=[args.com_x,args.com_y,args.com_z],
@@ -1212,7 +1217,7 @@ if __name__ == "__main__":
                                                 optimize_target=True,
                                                 optimize_palm=True, # NOTE: Experimental
                                                 num_iters=args.num_iters,
-                                                palm_offset=WRIST_OFFSET,
+                                                palm_offset=init_wrist_poses,
                                                 mass=args.mass, com=center[:3],
                                                 gravity=False,
                                                 uncertainty=args.uncertainty)
@@ -1222,22 +1227,50 @@ if __name__ == "__main__":
                                                 mass = args.mass, com=[args.com_x,args.com_y,args.com_z],
                                                 gravity=False,
                                                 uncertainty=args.uncertainty)
-    num_guesses = len(WRIST_OFFSET)
-    # Set initializations?
+    num_guesses = len(init_wrist_poses)
+    print("Number of initial guesses:", num_guesses)
+    # Get intial conditions
     init_joint_angles = init_joint_angles.repeat_interleave(num_guesses,dim=0)
-    #target_pose = target_pose.repeat_interleave(num_guesses,dim=0)
+    init_start_ftip_pos, target_pose = init_cond.get_start_and_target_ftip_pos(
+        init_wrist_poses, init_joint_angles, grasp_optimizer
+    )
+    # Save initial pose info
+    data_dict = {
+        "start_tip_pose": init_start_ftip_pos.cpu().detach().numpy(),
+        "target_tip_pose": target_pose.cpu().detach().numpy(),
+        "palm_pose": init_wrist_poses,
+        "input_pts": np.asarray(pcd.points),
+        "input_path": args.pcd_path,
+    }
+    save_path = "data/claire_data/init_con_test.npz"
+    np.savez_compressed(save_path, data=data_dict)
+    if args.viz_debug:
+        for i in range(num_guesses):
+            print("Initial condition:", i)
+            v_utils.vis_results(
+                pcd,
+                init_start_ftip_pos[i],
+                target_pose[i],
+                wrist_pose=init_wrist_poses[i],
+                draw_frame=True,
+                #wrist_frame="original",
+            )
     compliance = compliance.repeat_interleave(num_guesses,dim=0)
-    debug_tip_pose = grasp_optimizer.forward_kinematics(init_joint_angles, torch.from_numpy(WRIST_OFFSET).cuda())
-    target_pose = debug_tip_pose.mean(dim=1, keepdim=True).repeat(1,4,1)
-    target_pose = target_pose + (debug_tip_pose - target_pose) * 0.3
     if args.vis_gpis:
-        for i in range(debug_tip_pose.shape[0]):
-            tips, targets, arrows = vis_grasp(debug_tip_pose[i], target_pose[i])
+        for i in range(init_start_ftip_pos.shape[0]):
+            tips, targets, arrows = vis_grasp(init_start_ftip_pos[i], target_pose[i])
             o3d.visualization.draw_geometries([pcd, *tips, *targets, *arrows])
     if args.mode in ["sdf", "gpis"]:
         opt_tip_pose, opt_compliance, opt_target_pose, success_flag = grasp_optimizer.optimize(init_tip_pose, target_pose, compliance, friction_mu, mesh if args.mode == "sdf" else gpis, verbose=True)
     elif args.mode == "prob":
-        opt_joint_angles, opt_compliance, opt_target_pose, opt_palm_pose, opt_margin, opt_R, opt_t = grasp_optimizer.optimize(init_joint_angles,target_pose, compliance, friction_mu, gpis, verbose=True)
+        opt_joint_angles, opt_compliance, opt_target_pose, opt_palm_pose, opt_margin, opt_R, opt_t = grasp_optimizer.optimize(
+            init_joint_angles,
+            target_pose,
+            compliance,
+            friction_mu,
+            gpis,
+            verbose=True,
+        )
         opt_tip_pose = grasp_optimizer.forward_kinematics(opt_joint_angles, opt_palm_pose)
     elif args.mode == "wc":
         opt_tip_pose, opt_compliance, opt_target_pose, opt_palm_pose, opt_margin = grasp_optimizer.optimize(init_joint_angles, target_pose, compliance, friction_mu, gpis, verbose=True)
@@ -1265,34 +1298,18 @@ if __name__ == "__main__":
             continue
         if args.fast_exp:
             continue
-        #tips, targets, arrows = vis_grasp(opt_tip_pose[i], opt_target_pose[i])
-        #o3d.visualization.draw_geometries([pcd, *tips, *targets, *arrows])
-        #check_force_closure(tip_pose, opt_target_pose[i], opt_compliance[i], opt_R[i], opt_t[i], center[:3], args.mass, 10.0 if not args.disable_gravity else 0.0)
-        print("Grasp:", i)
-        v_utils.vis_results(pcd, opt_tip_pose[i], opt_target_pose[i])
-        if args.mode == "prob":
-            after_tip = (opt_R[i]@opt_tip_pose[i].transpose(0,1)).transpose(0,1)+opt_t[i]
-            #tips, targets, arrows = vis_grasp(after_tip, opt_target_pose[i])
-            tf_pcd = copy.deepcopy(pcd)
-            tf_pcd.rotate(opt_R[i].cpu().numpy(), center=[0,0,0])
-            tf_pcd.translate(opt_t[i].cpu().numpy())
-            #o3d.visualization.draw_geometries([tf_pcd, *tips, *targets, *arrows])
-            print(opt_palm_pose[i])
-            v_utils.vis_results(
-                tf_pcd, after_tip, opt_target_pose[i],
-                wrist_pose=opt_palm_pose[i].cpu().detach().numpy(),
-                draw_frame=True,
-            )
+    
     print("Feasible indices:",idx_list, "Feasible rate:", len(idx_list)/opt_tip_pose.shape[0])
     data_dict = {
         "feasible_idx": np.array([idx_list]),
-        "opt_tip_pose": opt_tip_pose.cpu().detach().numpy(),
-        "opt_target_pose": opt_target_pose.cpu().detach().numpy(),
-        "opt_palm_pose": opt_palm_pose.cpu().detach().numpy(),
-        "opt_compliance": opt_compliance.cpu().detach().numpy(),
+        "start_tip_pose": opt_tip_pose.cpu().detach().numpy(),
+        "target_tip_pose": opt_target_pose.cpu().detach().numpy(),
+        "palm_pose": opt_palm_pose.cpu().detach().numpy(),
+        "compliance": opt_compliance.cpu().detach().numpy(),
         "input_pts": np.asarray(pcd.points),
         "opt_t": opt_t.cpu().detach().numpy(),
         "opt_R": opt_R.cpu().detach().numpy(),
+        "input_path": args.pcd_path,
     }
     np.save(f"data/contact_{args.exp_name}.npy", opt_tip_pose.cpu().detach().numpy()[idx_list])
     np.save(f"data/target_{args.exp_name}.npy", opt_target_pose.cpu().detach().numpy()[idx_list])
@@ -1302,5 +1319,26 @@ if __name__ == "__main__":
         np.save(f"data/joint_angle_{args.exp_name}.npy", opt_joint_angles.cpu().detach().numpy()[idx_list])
         data_dict["opt_joint_angles"] = opt_joint_angles.cpu().detach().numpy()
     
-    #save_path = "data/claire_data/test.npz"
-    #np.savez_compressed(save_path, data=data_dict)
+    save_path = "data/claire_data/test.npz"
+    np.savez_compressed(save_path, data=data_dict)
+
+    # Viz feasible grasps
+    for i in idx_list:
+        print("Grasp:", i)
+        v_utils.vis_results(
+            pcd, opt_tip_pose[i], opt_target_pose[i],
+            wrist_pose=opt_palm_pose[i].cpu().detach().numpy(),
+        )
+        ## Visualize after predicted object movement??
+        #if args.mode == "prob":
+        #    after_tip = (opt_R[i]@opt_tip_pose[i].transpose(0,1)).transpose(0,1)+opt_t[i]
+        #    #tips, targets, arrows = vis_grasp(after_tip, opt_target_pose[i])
+        #    tf_pcd = copy.deepcopy(pcd)
+        #    tf_pcd.rotate(opt_R[i].cpu().numpy(), center=[0,0,0])
+        #    tf_pcd.translate(opt_t[i].cpu().numpy())
+        #    print(opt_palm_pose[i])
+        #    v_utils.vis_results(
+        #        tf_pcd, after_tip, opt_target_pose[i],
+        #        wrist_pose=opt_palm_pose[i].cpu().detach().numpy(),
+        #        draw_frame=True,
+        #    )
