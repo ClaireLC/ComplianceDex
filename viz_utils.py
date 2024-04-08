@@ -30,12 +30,45 @@ def vis_grasp(tip_pose, target_pose):
         arrows.append(arrow)
     return tips, targets, arrows
 
+def vis_wrist_pose(
+    pcd,
+    pose,
+    draw_frame=False,
+    wrist_frame="springgrasp",
+):
+    geoms_list = [pcd]
+
+    # Get wrist ref frame
+    mesh_wrist = o3d.geometry.TriangleMesh.create_coordinate_frame(
+        size=0.05
+    )
+    _wrist_R = Rotation.from_euler("XYZ",pose[3:])
+    if wrist_frame == "springgrasp":
+        wrist_R = (_wrist_R).as_matrix()
+    else:
+        # Transform from this wrist rotation to original local hand frame
+        transform = Rotation.from_euler("xyz", [0, 90, 0], degrees=True)
+        wrist_R = (_wrist_R*transform).as_matrix()
+    mesh_wrist.translate(pose[:3])
+    mesh_wrist.rotate(wrist_R)
+    geoms_list.append(mesh_wrist)
+
+    if draw_frame:
+        # Global ref frame
+        mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+            size=0.1, origin=[0, 0, 0]
+        )
+        geoms_list.append(mesh_frame)
+
+    o3d.visualization.draw_geometries(geoms_list)
+
 def vis_results(
     pcd,
     init_ftip_pos,
     target_ftip_pos,
     draw_frame=False,
     wrist_pose=None,
+    wrist_frame="springgrasp",
 ):
     # Get geometries to visualize grasp
     tips, targets, arrows = vis_grasp(init_ftip_pos, target_ftip_pos)
@@ -59,11 +92,13 @@ def vis_results(
         wrist_pos = wrist_pose[:3]
         wrist_ori_XYZ = wrist_pose[3:]
 
-        # Transform from this wrist rotation to original local hand frame
         _wrist_R = Rotation.from_euler("XYZ",wrist_pose[3:])
-        transform = Rotation.from_euler("xyz", [0, 90, 0], degrees=True)
-        wrist_R = (_wrist_R*transform).as_matrix()
-        print(wrist_pose)
+        if wrist_frame == "springgrasp":
+            wrist_R = (_wrist_R).as_matrix()
+        else:
+            # Transform from this wrist rotation to original local hand frame
+            transform = Rotation.from_euler("xyz", [0, 90, 0], degrees=True)
+            wrist_R = (_wrist_R*transform).as_matrix()
 
         mesh_wrist.translate(wrist_pos)
         mesh_wrist.rotate(wrist_R)
@@ -73,14 +108,14 @@ def vis_results(
 
 def main(args):
     grasp_dict = np.load(args.grasp_path, allow_pickle=True)["data"].item() 
-    grasp_i = 6
+    grasp_i = 0
 
     pts = grasp_dict["input_pts"]
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
-    init_ftip_pos = grasp_dict["opt_tip_pose"][grasp_i]
-    target_ftip_pos = grasp_dict["opt_target_pose"][grasp_i]
-    palm_pose = grasp_dict["opt_palm_pose"][grasp_i]
+    init_ftip_pos = grasp_dict["start_tip_pose"][grasp_i]
+    target_ftip_pos = grasp_dict["target_tip_pose"][grasp_i]
+    palm_pose = grasp_dict["palm_pose"][grasp_i]
 
     vis_results(
         pcd,
