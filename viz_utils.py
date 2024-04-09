@@ -3,6 +3,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 import argparse
 import torch
+from tqdm import tqdm
+import os
 
 from create_arrow import create_direct_arrow
 
@@ -69,21 +71,29 @@ def vis_results(
     draw_frame=False,
     wrist_pose=None,
     wrist_frame="springgrasp",
+    save_path=None,
 ):
+    # Plot and save without opening a window
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+    
     # Get geometries to visualize grasp
     tips, targets, arrows = vis_grasp(init_ftip_pos, target_ftip_pos)
 
     geoms_list = [
         pcd, *tips, *targets, *arrows,
     ]
+    for g in geoms_list:
+        vis.add_geometry(g)
 
     # Draw reference frame
     if draw_frame:
         mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
             size=0.1, origin=[0, 0, 0]
         )
-        geoms_list.append(mesh_frame)
-    
+        vis.add_geometry(mesh_frame)
+
     # Draw wrist
     if wrist_pose is not None:
         mesh_wrist = o3d.geometry.TriangleMesh.create_coordinate_frame(
@@ -102,28 +112,77 @@ def vis_results(
 
         mesh_wrist.translate(wrist_pos)
         mesh_wrist.rotate(wrist_R)
-        geoms_list.append(mesh_wrist)
+        vis.add_geometry(mesh_wrist)
+    
+        # Move viewing camera
+        ctr = vis.get_view_control()
+        fov = ctr.get_field_of_view()
+        param = ctr.convert_to_pinhole_camera_parameters()
+        H = np.eye(4)
+        #if cam_frame_x_front:
+        #    # Camera frame that points are in has +x facing viewing direction
+        #    # Rotate open3d viz camera accordingly
+        cam_R = Rotation.from_euler("XYZ", [0, 180, 0], degrees=True).as_matrix()
+        H[:3, :3] = _wrist_R.as_matrix().T @ cam_R
+        H[:3, 3] = H[:3, :3] @ -wrist_pos
+        H[2, 3] += 0.3  # Move camera back
+        param.extrinsic = H
+        ctr.convert_from_pinhole_camera_parameters(param)
+        _param = ctr.convert_to_pinhole_camera_parameters()
+    
+    vis.poll_events()
+    vis.update_renderer()
 
-    o3d.visualization.draw_geometries(geoms_list)
+    if save_path is None:
+        vis.run()
+    else:
+        vis.capture_screen_image(
+            save_path,
+            do_render=True,
+        )
+    vis.destroy_window()
+
 
 def main(args):
     grasp_dict = np.load(args.grasp_path, allow_pickle=True)["data"].item() 
-    grasp_i = 0
 
-    pts = grasp_dict["input_pts"]
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts)
-    init_ftip_pos = grasp_dict["start_tip_pose"][grasp_i]
-    target_ftip_pos = grasp_dict["target_tip_pose"][grasp_i]
-    palm_pose = grasp_dict["palm_pose"][grasp_i]
+    # Create save dir
+    grasp_name = os.path.splitext(os.path.basename(args.grasp_path))[0]
+    save_dir = os.path.join(os.path.dirname(args.grasp_path), f"{grasp_name}_img")
+    if not os.path.exists(save_dir): os.makedirs(save_dir)
 
-    vis_results(
-        pcd,
-        init_ftip_pos,
-        target_ftip_pos,
-        draw_frame=True,
-        wrist_pose=palm_pose,
-    )
+    if "feasible_idx" in grasp_dict:
+        feasible_idx = grasp_dict["feasible_idx"]
+    else:
+        feasible_idx = None
+
+    # Iterate through grasps in grasp_path.npz
+    for grasp_i in tqdm(range(grasp_dict["palm_pose"].shape[0])):
+        pts = grasp_dict["input_pts"]
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts)
+        init_ftip_pos = grasp_dict["start_tip_pose"][grasp_i]
+        target_ftip_pos = grasp_dict["target_tip_pose"][grasp_i]
+        palm_pose = grasp_dict["palm_pose"][grasp_i]
+
+        if args.save:
+            save_name = f"grasp_{grasp_i}"
+            if feasible_idx is not None and grasp_i in feasible_idx:
+                save_name += "_feasible"
+            save_name += ".png"
+            save_path = os.path.join(save_dir, save_name)
+        else:
+            save_path = None
+
+        vis_results(
+            pcd,
+            init_ftip_pos,
+            target_ftip_pos,
+            #draw_frame=True,
+            wrist_pose=palm_pose,
+            wrist_frame="original",
+            save_path=save_path,
+        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -132,5 +191,6 @@ if __name__ == "__main__":
         type=str,
         help="Path to .npz file with grasp optimization results",
     )
+    parser.add_argument("--save", "-s", action="store_true")
     args = parser.parse_args()
     main(args)
