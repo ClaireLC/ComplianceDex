@@ -123,8 +123,8 @@ def vis_results(
         #    # Camera frame that points are in has +x facing viewing direction
         #    # Rotate open3d viz camera accordingly
         cam_R = Rotation.from_euler("XYZ", [0, 180, 0], degrees=True).as_matrix()
-        H[:3, :3] = _wrist_R.as_matrix().T @ cam_R
-        H[:3, 3] = H[:3, :3] @ -wrist_pos
+        H[:3, :3] = (_wrist_R.as_matrix() @ cam_R).T
+        H[:3, 3] = -H[:3, :3] @ wrist_pos
         H[2, 3] += 0.3  # Move camera back
         param.extrinsic = H
         ctr.convert_from_pinhole_camera_parameters(param)
@@ -147,9 +147,10 @@ def main(args):
     grasp_dict = np.load(args.grasp_path, allow_pickle=True)["data"].item() 
 
     # Create save dir
-    grasp_name = os.path.splitext(os.path.basename(args.grasp_path))[0]
-    save_dir = os.path.join(os.path.dirname(args.grasp_path), f"{grasp_name}_img")
-    if not os.path.exists(save_dir): os.makedirs(save_dir)
+    if args.save:
+        grasp_name = os.path.splitext(os.path.basename(args.grasp_path))[0]
+        save_dir = os.path.join(os.path.dirname(args.grasp_path), f"{grasp_name}_img")
+        if not os.path.exists(save_dir): os.makedirs(save_dir)
 
     if "feasible_idx" in grasp_dict:
         feasible_idx = grasp_dict["feasible_idx"]
@@ -178,7 +179,7 @@ def main(args):
             pcd,
             init_ftip_pos,
             target_ftip_pos,
-            #draw_frame=True,
+            draw_frame=(save_path is None),
             wrist_pose=palm_pose,
             wrist_frame="original",
             save_path=save_path,
